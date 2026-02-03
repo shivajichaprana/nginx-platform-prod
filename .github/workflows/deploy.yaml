@@ -68,14 +68,21 @@ jobs:
           echo "Registered task definition: $TASK_DEF_ARN"
           echo "GREEN_TG=$GREEN_TG" >> $GITHUB_ENV
           
-          # Create new ECS service for green deployment
-          SERVICE_EXISTS=$(aws ecs describe-services \
+          # Check if GREEN service exists
+          if aws ecs describe-services \
             --cluster nginx-fargate-demo-cluster \
             --services nginx-fargate-demo-prod-green \
             --query 'services[0].status' \
-            --output text 2>/dev/null || echo "MISSING")
-          
-          if [ "$SERVICE_EXISTS" = "MISSING" ] || [ "$SERVICE_EXISTS" = "INACTIVE" ]; then
+            --output text 2>/dev/null | grep -q "ACTIVE"; then
+            
+            echo "Updating existing GREEN service..."
+            aws ecs update-service \
+              --cluster nginx-fargate-demo-cluster \
+              --service nginx-fargate-demo-prod-green \
+              --task-definition $TASK_DEF_ARN \
+              --desired-count 2 \
+              --force-new-deployment
+          else
             echo "Creating new GREEN service..."
             aws ecs create-service \
               --cluster nginx-fargate-demo-cluster \
@@ -87,14 +94,6 @@ jobs:
               --load-balancers targetGroupArn=$GREEN_TG,containerName=nginx,containerPort=80 \
               --health-check-grace-period-seconds 60 \
               --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100,deploymentCircuitBreaker={enable=true,rollback=true}"
-          else
-            echo "Updating existing GREEN service..."
-            aws ecs update-service \
-              --cluster nginx-fargate-demo-cluster \
-              --service nginx-fargate-demo-prod-green \
-              --task-definition $TASK_DEF_ARN \
-              --desired-count 2 \
-              --force-new-deployment
           fi
           
           echo "Waiting for GREEN service stability..."
@@ -110,4 +109,4 @@ jobs:
         if: always()
         run: |
           echo "Recent logs from production:"
-          aws logs tail /ecs/nginx-fargate-demo-prod --since 5m --format short || true
+          aws logs tail /ecs/nginx-fargate-demo-prod --since 5m --format short 2>/dev/null || echo "No logs available"
