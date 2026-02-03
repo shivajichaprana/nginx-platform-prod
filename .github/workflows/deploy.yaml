@@ -52,8 +52,13 @@ jobs:
           container-name: nginx
           image: ${{ env.IMAGE_URI }}
 
-      - name: Deploy to ECS
+      - name: Deploy to GREEN target group (0% traffic)
         run: |
+          GREEN_TG=$(aws elbv2 describe-target-groups \
+            --names nginx-fargate-demo-prod-green \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          
           # Register new task definition
           TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://${{ steps.task-def.outputs.task-definition }} \
@@ -61,23 +66,45 @@ jobs:
             --output text)
           
           echo "Registered task definition: $TASK_DEF_ARN"
+          echo "GREEN_TG=$GREEN_TG" >> $GITHUB_ENV
           
-          # Update service with new task definition
-          # Tasks will register to blue target group (service default)
-          aws ecs update-service \
+          # Create new ECS service for green deployment
+          SERVICE_EXISTS=$(aws ecs describe-services \
             --cluster nginx-fargate-demo-cluster \
-            --service nginx-fargate-demo-prod-service \
-            --task-definition $TASK_DEF_ARN \
-            --force-new-deployment
+            --services nginx-fargate-demo-prod-green \
+            --query 'services[0].status' \
+            --output text 2>/dev/null || echo "MISSING")
           
-          echo "Waiting for service stability..."
+          if [ "$SERVICE_EXISTS" = "MISSING" ] || [ "$SERVICE_EXISTS" = "INACTIVE" ]; then
+            echo "Creating new GREEN service..."
+            aws ecs create-service \
+              --cluster nginx-fargate-demo-cluster \
+              --service-name nginx-fargate-demo-prod-green \
+              --task-definition $TASK_DEF_ARN \
+              --desired-count 2 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[subnet-03702167be15c0f4b,subnet-0e0e6b45ecdef583d],securityGroups=[sg-0e0de858f860e2b8d],assignPublicIp=DISABLED}" \
+              --load-balancers targetGroupArn=$GREEN_TG,containerName=nginx,containerPort=80 \
+              --health-check-grace-period-seconds 60 \
+              --deployment-configuration "maximumPercent=200,minimumHealthyPercent=100,deploymentCircuitBreaker={enable=true,rollback=true}"
+          else
+            echo "Updating existing GREEN service..."
+            aws ecs update-service \
+              --cluster nginx-fargate-demo-cluster \
+              --service nginx-fargate-demo-prod-green \
+              --task-definition $TASK_DEF_ARN \
+              --desired-count 2 \
+              --force-new-deployment
+          fi
+          
+          echo "Waiting for GREEN service stability..."
           aws ecs wait services-stable \
             --cluster nginx-fargate-demo-cluster \
-            --services nginx-fargate-demo-prod-service
+            --services nginx-fargate-demo-prod-green
           
-          echo "✅ Deployment complete"
-          echo "⚠️  New tasks are running in blue target group"
-          echo "⚠️  Use traffic shift workflow to adjust weights"
+          echo "✅ Deployment complete to GREEN target group"
+          echo "⚠️  GREEN is receiving 0% traffic"
+          echo "⚠️  Use 'Traffic Shift' workflow to gradually shift traffic from BLUE to GREEN"
 
       - name: Get CloudWatch logs
         if: always()
