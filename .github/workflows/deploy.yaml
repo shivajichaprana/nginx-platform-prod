@@ -1,0 +1,86 @@
+name: Production Canary Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'ECR image tag to deploy (e.g., abc1234 or v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::975050061334:role/github-actions-nginx-platform-prod
+          aws-region: us-east-1
+
+      - name: Verify image exists in ECR
+        run: |
+          IMAGE_TAG="${{ inputs.image_tag }}"
+          ECR_REPO="975050061334.dkr.ecr.us-east-1.amazonaws.com/nginx-demo"
+          
+          echo "Verifying image: $ECR_REPO:$IMAGE_TAG"
+          aws ecr describe-images \
+            --repository-name nginx-demo \
+            --image-ids imageTag=$IMAGE_TAG \
+            --region us-east-1 || {
+              echo "ERROR: Image tag $IMAGE_TAG not found in ECR"
+              exit 1
+            }
+          
+          echo "IMAGE_URI=$ECR_REPO:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Render ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def-prod.json
+          container-name: nginx
+          image: ${{ env.IMAGE_URI }}
+
+      - name: Deploy to ECS
+        run: |
+          # Register new task definition
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ steps.task-def.outputs.task-definition }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "Registered task definition: $TASK_DEF_ARN"
+          
+          # Update service with new task definition
+          # Tasks will register to blue target group (service default)
+          aws ecs update-service \
+            --cluster nginx-fargate-demo-cluster \
+            --service nginx-fargate-demo-prod-service \
+            --task-definition $TASK_DEF_ARN \
+            --force-new-deployment
+          
+          echo "Waiting for service stability..."
+          aws ecs wait services-stable \
+            --cluster nginx-fargate-demo-cluster \
+            --services nginx-fargate-demo-prod-service
+          
+          echo "✅ Deployment complete"
+          echo "⚠️  New tasks are running in blue target group"
+          echo "⚠️  Use traffic shift workflow to adjust weights"
+
+      - name: Get CloudWatch logs
+        if: always()
+        run: |
+          echo "Recent logs from production:"
+          aws logs tail /ecs/nginx-fargate-demo-prod --since 5m --format short || true

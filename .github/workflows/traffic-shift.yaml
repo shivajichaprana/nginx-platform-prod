@@ -1,0 +1,106 @@
+name: Traffic Shift (Canary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      blue_weight:
+        description: 'Blue target group weight (0-100)'
+        required: true
+        type: number
+        default: 100
+      green_weight:
+        description: 'Green target group weight (0-100)'
+        required: true
+        type: number
+        default: 0
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  shift-traffic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+
+    steps:
+      - name: Validate weights
+        run: |
+          BLUE=${{ inputs.blue_weight }}
+          GREEN=${{ inputs.green_weight }}
+          TOTAL=$((BLUE + GREEN))
+          
+          if [ $TOTAL -ne 100 ]; then
+            echo "ERROR: Weights must sum to 100 (got $TOTAL)"
+            exit 1
+          fi
+          
+          echo "✅ Weights validated: Blue=$BLUE%, Green=$GREEN%"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::975050061334:role/github-actions-nginx-platform-prod
+          aws-region: us-east-1
+
+      - name: Get listener ARN
+        id: get-listener
+        run: |
+          LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn $(aws elbv2 describe-load-balancers \
+              --names nginx-fargate-demo-alb \
+              --query 'LoadBalancers[0].LoadBalancerArn' \
+              --output text) \
+            --query 'Listeners[?Port==`8080`].ListenerArn' \
+            --output text)
+          
+          echo "LISTENER_ARN=$LISTENER_ARN" >> $GITHUB_ENV
+          echo "Found listener: $LISTENER_ARN"
+
+      - name: Get target group ARNs
+        id: get-tgs
+        run: |
+          BLUE_TG=$(aws elbv2 describe-target-groups \
+            --names nginx-fargate-demo-prod-blue \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          
+          GREEN_TG=$(aws elbv2 describe-target-groups \
+            --names nginx-fargate-demo-prod-green \
+            --query 'TargetGroups[0].TargetGroupArn' \
+            --output text)
+          
+          echo "BLUE_TG=$BLUE_TG" >> $GITHUB_ENV
+          echo "GREEN_TG=$GREEN_TG" >> $GITHUB_ENV
+
+      - name: Shift traffic weights
+        run: |
+          echo "Shifting traffic: Blue=${{ inputs.blue_weight }}%, Green=${{ inputs.green_weight }}%"
+          
+          aws elbv2 modify-listener \
+            --listener-arn ${{ env.LISTENER_ARN }} \
+            --default-actions Type=forward,ForwardConfig="{
+              TargetGroups=[
+                {TargetGroupArn=${{ env.BLUE_TG }},Weight=${{ inputs.blue_weight }}},
+                {TargetGroupArn=${{ env.GREEN_TG }},Weight=${{ inputs.green_weight }}}
+              ],
+              TargetGroupStickinessConfig={Enabled=true,DurationSeconds=3600}
+            }"
+          
+          echo "✅ Traffic shift complete!"
+
+      - name: Check target health
+        run: |
+          echo "Blue target group health:"
+          aws elbv2 describe-target-health \
+            --target-group-arn ${{ env.BLUE_TG }} \
+            --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \
+            --output table
+          
+          echo ""
+          echo "Green target group health:"
+          aws elbv2 describe-target-health \
+            --target-group-arn ${{ env.GREEN_TG }} \
+            --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \
+            --output table
